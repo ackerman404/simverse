@@ -1,16 +1,16 @@
 import { useState, useEffect, useRef } from "react";
 import { CodeEditor } from "../CodeEditor";
-
+import { UAIbotView } from "../UAIbotView";
 import { GridMapView, type GridBounds, type Beacon } from "../../sim/GridMapView";
 import type { Obstacle } from "../../sim/sensors";
-import { RoverBlueprintStrip } from "./RoverBlueprintStrip";
+import { RoverBlueprintStrip } from "../mission1/RoverBlueprintStrip"; // Import from mission1
 import type { Mission } from "../../missions";
 import type { RobotPrimitive } from "../../lib/programTypes";
 import type { RobotCommand } from "../../lib/pythonRunner";
 import { buildTrajectory, type PoseSample } from "../../lib/trajectory";
 import { computeFrontDistance } from "../../sim/sensors";
 
-interface Mission1LayoutProps {
+interface Mission2LayoutProps {
     mission: Mission;
     code: string;
     onCodeChange: (code: string) => void;
@@ -25,10 +25,9 @@ interface Mission1LayoutProps {
     onStartDebrief: () => void;
     onOpenGarage: () => void;
     onBack: () => void;
-    isChallengeMode?: boolean;
 }
 
-export function Mission1Layout({
+export function Mission2Layout({
     mission,
     code,
     onCodeChange,
@@ -43,25 +42,18 @@ export function Mission1Layout({
     onStartDebrief,
     onOpenGarage,
     onBack,
-    isChallengeMode = false,
-}: Mission1LayoutProps) {
+}: Mission2LayoutProps) {
     // --- Simulation Constants & Helpers ---
-    const SCALE = 80; // px per meter
-    const WORLD_HEIGHT_PX = 400; // 5m
+    // Mission 2 uses Meters directly (Y-up).
+    // We just need a scale for the view bounds if we want to fix the aspect ratio.
+    // Let's say we want to show -1 to 5m in X, and -2 to 2m in Y?
+    // Start is 0,0. Wall is at 3.0.
 
-    const toMeters = (x: number, y: number) => ({
-        x: x / SCALE,
-        y: (WORLD_HEIGHT_PX - y) / SCALE
-    });
-
-    // Pre-calculate World Elements in Meters (Y-up)
-    const startMeters = toMeters(mission.world.start.x, mission.world.start.y);
-    // start.theta is 0 (Right). In Math (Y-up), 0 is Right. So no change needed.
-    const startTheta = mission.world.start.theta;
-
-    const goalMeters = {
-        ...toMeters(mission.world.goal.x, mission.world.goal.y),
-        r: mission.world.goal.r / SCALE
+    const bounds: GridBounds = {
+        minX: -0.5,
+        maxX: 4.5,
+        minY: -2.0,
+        maxY: 2.0
     };
 
     // --- Simulation State ---
@@ -77,17 +69,20 @@ export function Mission1Layout({
         const traj = buildTrajectory(program);
 
         // Transform trajectory to World Meters (Y-up)
+        // Mission 2 start is (0,0,0) usually, but let's respect mission.world.start
+        const start = mission.world.start;
+
         const worldTraj = traj.map(p => ({
             t: p.t,
-            // Simple 2D transform: rotate p by startTheta, then add to startMeters
-            x: startMeters.x + (p.x * Math.cos(startTheta) - p.y * Math.sin(startTheta)),
-            y: startMeters.y + (p.x * Math.sin(startTheta) + p.y * Math.cos(startTheta)),
-            theta: startTheta + p.theta
+            // Rotate then translate
+            x: start.x + (p.x * Math.cos(start.theta) - p.y * Math.sin(start.theta)),
+            y: start.y + (p.x * Math.sin(start.theta) + p.y * Math.cos(start.theta)),
+            theta: start.theta + p.theta
         }));
 
         // If empty, just start pose
         if (worldTraj.length === 0) {
-            worldTraj.push({ t: 0, x: startMeters.x, y: startMeters.y, theta: startTheta });
+            worldTraj.push({ t: 0, x: start.x, y: start.y, theta: start.theta });
         }
 
         setTrajectory(worldTraj);
@@ -95,7 +90,7 @@ export function Mission1Layout({
         setIsAnimating(true);
         hasReportedResultRef.current = false;
 
-    }, [program, runId, mission.world, startMeters.x, startMeters.y, startTheta]);
+    }, [program, runId, mission.world]);
 
     // --- 2. Animation Loop ---
     useEffect(() => {
@@ -116,10 +111,19 @@ export function Mission1Layout({
                         hasReportedResultRef.current = true;
                         const finalPose = trajectory[trajectory.length - 1];
 
-                        const dx = finalPose.x - goalMeters.x;
-                        const dy = finalPose.y - goalMeters.y;
-                        const dist = Math.sqrt(dx * dx + dy * dy);
-                        const success = dist <= goalMeters.r;
+                        // Mission 2 Success: Stop between 0.3m and 0.8m from the wall.
+                        // We can use computeFrontDistance to check the distance to the wall.
+                        // Or just check X coordinate if we know the wall is at X=3.0.
+                        // Using computeFrontDistance is more robust and "sim-like".
+
+                        const sensorWorld = {
+                            obstacles: mission.world.obstacles || []
+                        };
+
+                        const dist = computeFrontDistance(finalPose, sensorWorld);
+
+                        // Success range: 0.3 to 0.8
+                        const success = dist >= 0.3 && dist <= 0.8;
 
                         // Convert path to {x,y} array
                         const path = trajectory.map(p => ({ x: p.x, y: p.y }));
@@ -137,53 +141,18 @@ export function Mission1Layout({
         return () => {
             if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
         };
-    }, [isAnimating, trajectory, onResult, goalMeters]);
+    }, [isAnimating, trajectory, onResult, mission.world]);
 
     // --- 3. GridMapView Props ---
-    // Conversion (Pixels -> Meters)
-    // Mission 1 World is defined in Pixels (Y-down).
-    // GridMapView expects Meters (Y-up).
-    // We need to convert and flip Y.
-    // The user said "The sim core now uses RobotPose...".
-    // In `SimulatorView` fix, I used `SCALE = 80`.
-    // So `mission.world` coordinates are in PIXELS.
-    // `GridMapView` expects generic units.
-    // I should convert everything to METERS for `GridMapView` to be "proper".
-    //
-    // Actually, let's fix the useEffect logic instead of patching here.
-    // See the updated useEffect below.
+    const beacons: Beacon[] = [{
+        center: { x: mission.world.goal.x, y: mission.world.goal.y },
+        radius: mission.world.goal.r,
+        label: "GOAL"
+    }];
 
-    const bounds: GridBounds = {
-        minX: 0,
-        maxX: 600 / SCALE, // 7.5m
-        minY: 0,
-        maxY: WORLD_HEIGHT_PX / SCALE  // 5m
-    };
-
-    const beacons: Beacon[] = [
-        {
-            center: { x: 0, y: 0 },
-            radius: 0
-        },
-        {
-            center: { x: goalMeters.x, y: goalMeters.y },
-            radius: goalMeters.r
-        }
-    ];
-
-    const obstacles: Obstacle[] = [];
-    if (mission.world.crater) {
-        const c = toMeters(mission.world.crater.x, mission.world.crater.y);
-        obstacles.push({
-            type: "circle",
-            x: c.x,
-            y: c.y,
-            radius: mission.world.crater.rx / SCALE
-        });
-    }
+    const obstacles: Obstacle[] = mission.world.obstacles || [];
 
     // Current Pose & Path
-    // trajectory state is now expected to be in World Meters (Y-up).
     const currentPose = trajectory[stepIndex];
     const pathVecs = trajectory.map(p => ({ x: p.x, y: p.y }));
 
@@ -196,16 +165,10 @@ export function Mission1Layout({
 
     if (currentPose) {
         const sensorWorld = {
-            obstacles: obstacles
+            obstacles: mission.world.obstacles || []
         };
 
         const dist = computeFrontDistance(currentPose, sensorWorld);
-
-        // Compute ray endpoint
-        // If dist is maxRange (5.0), we still draw it to show "nothing detected" or "clear"
-        // But maybe we want to clamp it for visualization?
-        // computeFrontDistance returns maxRange if no hit.
-        // Let's draw the full ray.
 
         const rayEnd = {
             x: currentPose.x + dist * Math.cos(currentPose.theta),
@@ -219,7 +182,7 @@ export function Mission1Layout({
     }
 
     return (
-        <div className="h-screen overflow-hidden bg-slate-900 text-slate-100 flex flex-col">
+        <div className="min-h-screen bg-slate-900 text-slate-100 flex flex-col">
             {/* Header */}
             <header className="border-b border-slate-800 px-6 py-4 flex items-center justify-between bg-slate-950">
                 <div className="flex items-center gap-6">
@@ -234,22 +197,16 @@ export function Mission1Layout({
                     </button>
                     <div>
                         <h1 className="text-xl font-bold flex items-center gap-2">
-                            <span className="text-emerald-500">Mission 1:</span> Wake Prototype R-0
+                            <span className="text-emerald-500">{mission.shortName}:</span> {mission.title}
                         </h1>
                         <p className="text-xs text-slate-400">
-                            Initialize movement systems and reach the test pad.
+                            {mission.briefing}
                         </p>
                     </div>
-                    <button
-                        onClick={onOpenGarage}
-                        className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-md text-sm font-medium text-slate-200 transition-colors flex items-center gap-2"
-                    >
-                        <span>🔧</span> Garage
-                    </button>
                 </div>
                 <div className="flex flex-col items-end gap-1">
-                    <span className={`px-2 py-0.5 rounded text-[0.65rem] font-bold tracking-wider ${isChallengeMode ? "bg-red-900/50 text-red-400 border border-red-500/30" : "bg-emerald-900/50 text-emerald-400 border border-emerald-500/30"}`}>
-                        {isChallengeMode ? "LIVE MISSION" : "TRAINING RUN"}
+                    <span className="text-sm text-emerald-400 font-medium">
+                        Planet {mission.planet}
                     </span>
                     <span className="text-[0.7rem] text-slate-400">
                         Status: {lastRunSuccess ? "COMPLETE" : "PENDING"}
@@ -257,13 +214,13 @@ export function Mission1Layout({
                 </div>
             </header>
 
-            {/* Blueprint Strip */}
-            <RoverBlueprintStrip movementOnline={!!lastRunSuccess} />
+            {/* Blueprint Strip - Reused from Mission 1 for now */}
+            <RoverBlueprintStrip movementOnline={true} />
 
             {/* Main Content */}
-            <main className="flex-1 min-h-0 overflow-y-auto p-6 grid grid-cols-2 gap-6">
+            <main className="flex-1 p-6 grid grid-cols-2 gap-6 h-[calc(100vh-140px)]">
                 {/* Left Panel: Code Editor */}
-                <div className="flex flex-col gap-4 min-h-[500px] h-full">
+                <div className="flex flex-col gap-4 h-full">
                     <div className="flex-1 border border-slate-800 rounded-lg overflow-hidden">
                         <CodeEditor code={code} onChange={onCodeChange} />
                     </div>
@@ -284,29 +241,41 @@ export function Mission1Layout({
                     </div>
 
                     {status && (
-                        <div className={`p-3 rounded-md text-sm border ${lastRunSuccess
+                        <div className={`p - 3 rounded - md text - sm border ${lastRunSuccess
                             ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-300"
                             : "bg-slate-800 border-slate-700 text-slate-300"
-                            }`}>
+                            } `}>
                             {status}
                         </div>
                     )}
                 </div>
 
                 {/* Right Panel: Simulator */}
-                <div className="flex flex-col border border-slate-800 rounded-lg p-1 bg-slate-950 relative overflow-hidden min-h-[500px] h-full">
+                <div className="h-full flex flex-col border border-slate-800 rounded-lg p-1 bg-slate-950 relative overflow-hidden">
+                    <div className="absolute top-3 left-3 z-10 bg-slate-900/80 backdrop-blur px-3 py-1.5 rounded border border-slate-700 text-xs text-slate-300">
+                        🎥 Live Feed: Hangar Cam
+                    </div>
+
                     <div className="relative w-full h-full rounded overflow-hidden">
-                        <GridMapView
-                            bounds={bounds}
-                            path={pathVecs}
-                            beacons={beacons}
-                            obstacles={[]} // Hide obstacles (crater) from visual map as requested
-                            roverPose={currentPose}
-                            sensorRays={sensorRays}
-                            title="Mission 01 · Nova's Map"
-                            className="w-full h-full"
-                            showAxes={true}
+                        <UAIbotView
+                            world={mission.world}
+                            program={program}
+                            runId={runId}
                         />
+
+                        {/* Minimap Overlay */}
+                        <div className="absolute bottom-4 right-4 w-1/2 aspect-[4/3] max-w-[400px] shadow-xl">
+                            <GridMapView
+                                bounds={bounds}
+                                path={pathVecs}
+                                beacons={beacons}
+                                obstacles={mission.world.obstacles}
+                                roverPose={currentPose}
+                                sensorRays={sensorRays}
+                                title={`${mission.shortName} · Sensor View`}
+                                className="w-full h-full"
+                            />
+                        </div>
                     </div>
                 </div>
             </main>
@@ -317,19 +286,15 @@ export function Mission1Layout({
                     <div className="bg-slate-900 border border-emerald-500/50 p-8 rounded-xl shadow-2xl max-w-md text-center relative overflow-hidden">
                         <div className="absolute inset-0 bg-emerald-500/5 pointer-events-none" />
                         <div className="text-5xl mb-4">🎉</div>
-                        <h2 className="text-2xl font-bold text-white mb-2">
-                            {isChallengeMode ? "Mission Complete!" : "Training Run Complete!"}
-                        </h2>
+                        <h2 className="text-2xl font-bold text-white mb-2">Mission Complete!</h2>
                         <p className="text-slate-300 mb-6">
-                            {isChallengeMode
-                                ? "Prototype R-0 has successfully reached the test pad. Movement systems are now ONLINE."
-                                : "You've successfully guided Nova to the beacon. Proceed to Debrief to analyze the flight path."}
+                            Nova stopped safely near the wall using the front sensor.
                         </p>
                         <button
                             onClick={onStartDebrief}
                             className="px-6 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-900 font-bold rounded-full transition-colors"
                         >
-                            Start Debrief
+                            Next Mission
                         </button>
                     </div>
                 </div>

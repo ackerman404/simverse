@@ -9,45 +9,44 @@ export interface PoseSample {
 
 export function buildTrajectory(
   program: RobotPrimitive[],
+  startPose = { x: 0, y: 0, theta: 0 },
   dt = 0.02
 ): PoseSample[] {
   const samples: PoseSample[] = [];
 
   let t = 0;
-  let x = 0;
-  let y = 0;
-  let theta = 0; // 0 = facing +x
+  let { x, y, theta } = startPose;
 
   samples.push({ t, x, y, theta });
 
   for (const p of program) {
-    if (p.type === "move") {
-      if (p.speed <= 0) continue;
-      const dist = p.distance;
-      const T = Math.abs(dist / p.speed);
-      const steps = Math.max(1, Math.round(T / dt));
-      const stepDist = dist / steps;
+    if (p.type === "drive") {
+      const { v, w, duration } = p;
+      if (duration <= 0) continue;
+
+      const steps = Math.max(1, Math.round(duration / dt));
+      const dtStep = duration / steps; // precise dt for this segment
 
       for (let i = 0; i < steps; i++) {
-        x += stepDist * Math.cos(theta);
-        y += stepDist * Math.sin(theta);
-        t += dt;
+        // Simple Euler integration
+        // x_new = x + v * cos(theta) * dt
+        // y_new = y + v * sin(theta) * dt
+        // theta_new = theta + w * dt
+
+        // Half-step or Runge-Kutta would be better but Euler is fine for this MVP
+        x += v * Math.cos(theta) * dtStep;
+        y += v * Math.sin(theta) * dtStep;
+        theta += w * dtStep;
+        t += dtStep;
+
         samples.push({ t, x, y, theta });
       }
-    } else if (p.type === "turn") {
-      const angleRad = (p.angleDeg * Math.PI) / 180;
-      const wRad = (Math.abs(p.angularSpeed) * Math.PI) / 180;
-      if (wRad <= 0) continue;
-
-      const T = Math.abs(angleRad / wRad);
-      const steps = Math.max(1, Math.round(T / dt));
-      const stepAngle = angleRad / steps;
-
-      for (let i = 0; i < steps; i++) {
-        theta += stepAngle;
-        t += dt;
-        samples.push({ t, x, y, theta });
-      }
+    } else if (p.type === "set_pose") {
+      x = p.pose.x;
+      y = p.pose.y;
+      theta = p.pose.theta;
+      // Instantaneous update
+      samples.push({ t, x, y, theta });
     }
   }
 

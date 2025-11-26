@@ -3,36 +3,69 @@ import { CodeEditor } from "./components/CodeEditor";
 import { SimulatorView } from "./components/SimulatorView";
 import { UAIbotView } from "./components/UAIbotView";
 import { Mission1Layout } from "./components/mission1/Mission1Layout";
-import { extractCommands, type RobotCommand } from "./lib/pythonRunner";
-import { buildProgram } from "./lib/programBuilder";
+import { Mission2Layout } from "./components/mission2/Mission2Layout";
+import { TeachingStage } from "./components/TeachingStage";
+import { runPython } from "./lib/pythonRunner";
+import type { RobotCommand } from "./lib/pythonRunner";
+// import { buildProgram } from "./lib/programBuilder"; // No longer needed
 import type { RobotPrimitive } from "./lib/programTypes";
 import { MISSIONS, type Mission } from "./missions";
 
 const CODE_STORAGE_KEY = "simverse_nova_code_v1";
+const CHALLENGE_CODE_STORAGE_KEY = "simverse_nova_challenge_code_v1";
 const PROGRESS_STORAGE_KEY = "simverse_nova_progress_v1";
+const TRAINING_PROGRESS_STORAGE_KEY = "simverse_nova_training_progress_v1";
+const ROVER_CONFIG_STORAGE_KEY = "simverse_rover_config";
+
+import { RoverMovementRewardStage, type MovementConfig } from "./rover/RoverMovementRewardStage";
+
+import { RoverGarage } from "./rover/RoverGarage";
+
+import { SolarSystemHome } from "./home/SolarSystemHome";
 
 const USE_UAIBOT_VIEW = true;
 
 type CodeMap = Record<string, string>;
 type ProgressMap = Record<string, boolean>;
 
-function loadCodeMap(): CodeMap {
+function loadCodeMap(key: string): CodeMap {
   if (typeof window === "undefined") return {};
   try {
-    const raw = window.localStorage.getItem(CODE_STORAGE_KEY);
+    const raw = window.localStorage.getItem(key);
     return raw ? (JSON.parse(raw) as CodeMap) : {};
   } catch {
     return {};
   }
 }
 
-function loadProgressMap(): ProgressMap {
+function loadProgressMap(key: string): ProgressMap {
   if (typeof window === "undefined") return {};
   try {
-    const raw = window.localStorage.getItem(PROGRESS_STORAGE_KEY);
+    const raw = window.localStorage.getItem(key);
     return raw ? (JSON.parse(raw) as ProgressMap) : {};
   } catch {
     return {};
+  }
+}
+
+type LastSuccessfulRun = {
+  missionId: string;
+  path: { x: number; y: number }[];
+};
+
+type ActiveStage = "missions" | "playing" | "teaching" | "rewardMovement" | "garage";
+
+interface RoverConfig {
+  movement: MovementConfig;
+}
+
+function loadRoverConfig(): RoverConfig {
+  if (typeof window === "undefined") return { movement: { color: "#f97316", wheelScale: 1.0 } };
+  try {
+    const raw = window.localStorage.getItem(ROVER_CONFIG_STORAGE_KEY);
+    return raw ? JSON.parse(raw) : { movement: { color: "#f97316", wheelScale: 1.0 } };
+  } catch {
+    return { movement: { color: "#f97316", wheelScale: 1.0 } };
   }
 }
 
@@ -45,12 +78,22 @@ function App() {
   const [runId, setRunId] = useState(0);
 
   const [codeByMission, setCodeByMission] = useState<CodeMap>({});
+  const [challengeCodeByMission, setChallengeCodeByMission] = useState<CodeMap>({});
   const [completedMissions, setCompletedMissions] = useState<ProgressMap>({});
+  const [trainingProgress, setTrainingProgress] = useState<ProgressMap>({});
   const [lastRunSuccess, setLastRunSuccess] = useState<boolean | null>(null);
+  const [lastSuccessfulRunData, setLastSuccessfulRunData] = useState<LastSuccessfulRun | null>(null);
+  const [isChallengeMode, setIsChallengeMode] = useState(false);
+
+  // New state for stages
+  const [activeStage, setActiveStage] = useState<ActiveStage>("missions");
+  const [roverConfig, setRoverConfig] = useState<RoverConfig>(loadRoverConfig);
+  const [rewardSource, setRewardSource] = useState<"unlock" | "garage">("unlock");
 
   const currentMission: Mission =
     MISSIONS.find((m) => m.id === currentMissionId) ?? MISSIONS[0];
 
+  // ... (existing effects and handlers)
   const completedCount = Object.values(completedMissions).filter(Boolean).length;
   const progressPercent =
     MISSIONS.length === 0
@@ -62,10 +105,14 @@ function App() {
 
   // Load saved code + progress on first mount
   useEffect(() => {
-    const savedCode = loadCodeMap();
-    const savedProgress = loadProgressMap();
+    const savedCode = loadCodeMap(CODE_STORAGE_KEY);
+    const savedChallengeCode = loadCodeMap(CHALLENGE_CODE_STORAGE_KEY);
+    const savedProgress = loadProgressMap(PROGRESS_STORAGE_KEY);
+    const savedTraining = loadProgressMap(TRAINING_PROGRESS_STORAGE_KEY);
     setCodeByMission(savedCode);
+    setChallengeCodeByMission(savedChallengeCode);
     setCompletedMissions(savedProgress);
+    setTrainingProgress(savedTraining);
 
     const initialMission = MISSIONS[0];
     const initialCode = savedCode[initialMission.id] ?? initialMission.defaultCode;
@@ -76,13 +123,23 @@ function App() {
   // Update code for current mission + persist
   const handleCodeChange = (newCode: string) => {
     setCode(newCode);
-    setCodeByMission((prev) => {
-      const updated: CodeMap = { ...prev, [currentMissionId]: newCode };
-      if (typeof window !== "undefined") {
-        window.localStorage.setItem(CODE_STORAGE_KEY, JSON.stringify(updated));
-      }
-      return updated;
-    });
+    if (isChallengeMode) {
+      setChallengeCodeByMission((prev) => {
+        const updated: CodeMap = { ...prev, [currentMissionId]: newCode };
+        if (typeof window !== "undefined") {
+          window.localStorage.setItem(CHALLENGE_CODE_STORAGE_KEY, JSON.stringify(updated));
+        }
+        return updated;
+      });
+    } else {
+      setCodeByMission((prev) => {
+        const updated: CodeMap = { ...prev, [currentMissionId]: newCode };
+        if (typeof window !== "undefined") {
+          window.localStorage.setItem(CODE_STORAGE_KEY, JSON.stringify(updated));
+        }
+        return updated;
+      });
+    }
   };
 
   const handleSelectMission = (id: string) => {
@@ -90,6 +147,7 @@ function App() {
     if (!mission) return;
 
     setCurrentMissionId(id);
+    setIsChallengeMode(false); // Reset challenge mode on mission switch
     const saved = codeByMission[id] ?? mission.defaultCode;
     setCode(saved);
     setCommands([]);
@@ -99,30 +157,47 @@ function App() {
     setLastRunSuccess(null);
   };
 
-  const handleRun = () => {
-    const cmds = extractCommands(code);
-    console.log("Parsed commands:", cmds);
-
+  const handleRun = async () => {
+    // Clear previous state
     setLastRunSuccess(null);
+    setStatus(`Running simulation... Tracking Nova on ${currentMission.planet}.`);
+    setCommands([]); // We don't use commands list for UI anymore with Skulpt, or we could populate it from primitives?
+    // Actually, we can't easily get the list of commands *before* running with Skulpt unless we parse it.
+    // But we want to run it.
 
-    if (cmds.length === 0) {
-      setStatus(
-        "No valid commands found. Use move_forward(), turn_left(), turn_right()."
-      );
-      setCommands([]);
-      setProgram([]);
-      return;
+    try {
+      // Convert mission world to WorldGeometry
+      const worldGeo = {
+        obstacles: [] as any[]
+      };
+      if (currentMission.world.crater) {
+        worldGeo.obstacles.push({
+          type: "circle",
+          x: currentMission.world.crater.x,
+          y: currentMission.world.crater.y,
+          radius: currentMission.world.crater.rx // approximating ellipse as circle for sensor
+        });
+      }
+
+      // Run Python code
+      // We pass the start pose so the runner knows where the robot is
+      // In challenge mode, start pose is same, but goal is different.
+      // But runPython doesn't care about goal, only start.
+      const startPose = currentMission.world.start;
+      const prog = await runPython(code, worldGeo, startPose);
+
+      console.log("Built program:", prog);
+
+      setProgram(prog);
+      setRunId((prev) => prev + 1);
+
+      if (prog.length === 0) {
+        setStatus("Program finished but produced no movements.");
+      }
+    } catch (err) {
+      console.error("Python error:", err);
+      setStatus(`Error: ${err}`);
     }
-
-    const prog = buildProgram(cmds);
-    console.log("Built program:", prog);
-
-    setCommands(cmds);
-    setProgram(prog);
-    setRunId((prev) => prev + 1);
-    setStatus(
-      `Running simulation... Tracking Nova on ${currentMission.planet}.`
-    );
   };
 
   const handleReset = () => {
@@ -134,16 +209,29 @@ function App() {
   };
 
   const handleResetToStarter = () => {
-    const starter = currentMission.defaultCode;
+    const starter = isChallengeMode
+      ? (currentMission.challenge?.starterComments ?? "")
+      : currentMission.defaultCode;
+
     setCode(starter);
 
-    setCodeByMission((prev) => {
-      const updated: CodeMap = { ...prev, [currentMission.id]: starter };
-      if (typeof window !== "undefined") {
-        window.localStorage.setItem(CODE_STORAGE_KEY, JSON.stringify(updated));
-      }
-      return updated;
-    });
+    if (isChallengeMode) {
+      setChallengeCodeByMission((prev) => {
+        const updated: CodeMap = { ...prev, [currentMission.id]: starter };
+        if (typeof window !== "undefined") {
+          window.localStorage.setItem(CHALLENGE_CODE_STORAGE_KEY, JSON.stringify(updated));
+        }
+        return updated;
+      });
+    } else {
+      setCodeByMission((prev) => {
+        const updated: CodeMap = { ...prev, [currentMission.id]: starter };
+        if (typeof window !== "undefined") {
+          window.localStorage.setItem(CODE_STORAGE_KEY, JSON.stringify(updated));
+        }
+        return updated;
+      });
+    }
 
     setCommands([]);
     setProgram([]);
@@ -153,234 +241,276 @@ function App() {
     setLastRunSuccess(null);
   };
 
-  const handleResult = (success: boolean) => {
-    if (commands.length === 0) return;
+  const handleResult = (success: boolean, path?: { x: number; y: number }[]) => {
+    // if (commands.length === 0) return; // Removed: commands is empty in Skulpt mode
     setLastRunSuccess(success);
 
     if (success) {
+      console.log("App handleResult success. Path:", path);
       setStatus(
-        `✅ Mission complete! Nova reached the beacon for ${currentMission.shortName}.`
+        `✅ ${isChallengeMode ? "Challenge" : "Mission"} complete! Nova reached the beacon for ${currentMission.shortName}.`
       );
-      setCompletedMissions((prev) => {
-        const updated: ProgressMap = { ...prev, [currentMission.id]: true };
-        if (typeof window !== "undefined") {
-          window.localStorage.setItem(
-            PROGRESS_STORAGE_KEY,
-            JSON.stringify(updated)
-          );
-        }
-        return updated;
-      });
+
+      if (path && !isChallengeMode) {
+        // Only save path for normal mission for replay
+        setLastSuccessfulRunData({
+          missionId: currentMissionId,
+          path: path,
+        });
+      }
+
+      if (!isChallengeMode) {
+        // Training Run Success
+        setTrainingProgress((prev) => {
+          const updated: ProgressMap = { ...prev, [currentMission.id]: true };
+          if (typeof window !== "undefined") {
+            window.localStorage.setItem(
+              TRAINING_PROGRESS_STORAGE_KEY,
+              JSON.stringify(updated)
+            );
+          }
+          return updated;
+        });
+        setStatus(`✅ Training complete! You've reached the beacon. Proceed to Debrief.`);
+      } else {
+        // Challenge Mode Success (Mastery)
+        setCompletedMissions((prev) => {
+          const updated: ProgressMap = { ...prev, [currentMission.id]: true };
+          if (typeof window !== "undefined") {
+            window.localStorage.setItem(
+              PROGRESS_STORAGE_KEY,
+              JSON.stringify(updated)
+            );
+          }
+          return updated;
+        });
+        // We will transition to reward stage via handleDebriefComplete or direct if we skip debrief?
+        // Actually, for challenge mode, we might want to show a "Challenge Complete" modal or just status.
+        // But the user said: "Challenge success -> Reward unlock".
+        // Let's rely on the user clicking "Next" or "Debrief" to trigger the transition?
+        // Or auto-transition?
+        // The current flow has a "Debrief" button in Mission1Layout.
+        // Let's keep it consistent.
+      }
     } else {
       setStatus(
-        "🛰️ Nova missed the beacon. Adjust your route and try the mission again."
+        "🛰️ Nova missed the beacon. Adjust your route and try again."
       );
     }
   };
 
-  if (currentMissionId === "exo1-m1") {
+  const handleStartDebrief = () => {
+    if (currentMission.teaching && !isChallengeMode) {
+      setActiveStage("teaching");
+    } else {
+      // Skip teaching if not configured or if in Challenge Mode (Mastery)
+      handleDebriefComplete();
+    }
+  };
+
+  const handleDebriefComplete = () => {
+    // Transition logic
+    if (currentMissionId === "exo1-m1") {
+      if (isChallengeMode) {
+        // Challenge Complete -> Reward
+        setRewardSource("unlock");
+        setActiveStage("rewardMovement");
+      } else {
+        // Training Complete -> Stay in Debrief (which has the "Start Challenge" button)
+        // OR go back to Missions?
+        // The "Complete Debrief & Continue" button in TeachingStage calls this.
+        // If we are in Training mode, and we click that button, what should happen?
+        // The user said: "Training success -> Debrief only. No garage part yet."
+        // And "At the bottom of Debrief: ... Start Mission Challenge".
+        // So the "Complete Debrief" button might be confusing if it exits.
+        // But TeachingStage has "Start Mission Challenge" as a separate button now (via onStartChallenge).
+        // The "Complete Debrief" button is usually for "I'm done reading".
+        // If they click "Complete Debrief" in training, maybe just go back to missions?
+        setActiveStage("missions");
+        handleReset();
+      }
+    } else {
+      setActiveStage("missions");
+      handleReset();
+    }
+    setLastRunSuccess(null);
+  };
+
+  const updateMovementConfig = (config: MovementConfig) => {
+    const newConfig = { ...roverConfig, movement: config };
+    setRoverConfig(newConfig);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(ROVER_CONFIG_STORAGE_KEY, JSON.stringify(newConfig));
+    }
+  };
+
+  const goToGarage = () => {
+    setActiveStage("garage");
+  };
+
+  const handleStartChallenge = () => {
+    if (!currentMission.challenge) return;
+
+    setIsChallengeMode(true);
+    const saved = challengeCodeByMission[currentMissionId] ?? currentMission.challenge.starterComments;
+    setCode(saved);
+    setCommands([]);
+    setProgram([]);
+    setRunId((prev) => prev + 1);
+    setStatus("");
+    setLastRunSuccess(null);
+    setActiveStage("playing");
+  };
+
+  // ... (existing handlers)
+
+  if (activeStage === "teaching" && currentMission.teaching) {
     return (
-      <Mission1Layout
-        mission={currentMission}
-        code={code}
-        onCodeChange={handleCodeChange}
-        onRun={handleRun}
-        onReset={handleReset}
-        status={status}
-        lastRunSuccess={lastRunSuccess}
-        program={program}
-        runId={runId}
-        commands={commands}
-        onResult={handleResult}
+      <TeachingStage
+        config={currentMission.teaching}
+        onComplete={handleDebriefComplete}
+        lastSuccessfulRun={lastSuccessfulRunData}
+        missionId={currentMission.id}
+        onStartChallenge={handleStartChallenge}
       />
     );
   }
 
-  return (
-    <div className="min-h-screen bg-slate-900 text-slate-100">
-      <header className="border-b border-slate-800 px-6 py-4 flex items-center justify-between">
-        <div>
-          <h1 className="text-xl font-bold">Simverse: Nova Missions</h1>
-          <p className="text-xs text-slate-400">
-            Off-world rover programming for future explorers
-          </p>
-        </div>
-        <div className="flex flex-col items-end gap-1">
-          <span className="text-sm text-emerald-400 font-medium">
-            Planet {currentMission.planet} · {currentMission.shortName}
-          </span>
-          <span className="text-[0.7rem] text-slate-400">
-            {completedCount}/{MISSIONS.length} missions complete
-          </span>
-        </div>
-      </header>
-
-      {/* Mission tabs */}
-      <div className="px-6 pt-3 flex flex-wrap gap-2">
-        {MISSIONS.map((m) => {
-          const active = m.id === currentMissionId;
-          const completed = completedMissions[m.id];
-
-          let classes =
-            "px-3 py-1 rounded-full text-xs border flex items-center gap-1 transition-colors ";
-          if (active) {
-            classes +=
-              "bg-emerald-500 text-slate-900 border-emerald-400 shadow-sm shadow-emerald-500/40";
-          } else if (completed) {
-            classes +=
-              "bg-emerald-950/40 text-emerald-200 border-emerald-500/40 hover:bg-emerald-900/40";
+  if (activeStage === "rewardMovement") {
+    return (
+      <RoverMovementRewardStage
+        movementConfig={roverConfig.movement}
+        onUpdateMovement={updateMovementConfig}
+        justUnlocked={rewardSource === "unlock"}
+        onDone={() => {
+          if (rewardSource === "garage") {
+            setActiveStage("garage");
           } else {
-            classes +=
-              "bg-slate-900 text-slate-300 border-slate-700 hover:bg-slate-800";
+            setActiveStage("missions");
+            handleReset();
           }
+        }}
+      />
+    );
+  }
 
-          return (
-            <button
-              key={m.id}
-              onClick={() => handleSelectMission(m.id)}
-              className={classes}
-            >
-              <span className="inline-flex items-center gap-1">
-                {active && <span>🛰️</span>}
-                <span>
-                  {m.shortName}: {m.title}
-                </span>
-              </span>
-              {completed && !active && <span>⭐</span>}
-              {completed && active && <span>⭐</span>}
-            </button>
-          );
-        })}
+  if (activeStage === "garage") {
+    return (
+      <RoverGarage
+        roverConfig={roverConfig}
+        onCustomizeMovement={() => {
+          setRewardSource("garage");
+          setActiveStage("rewardMovement");
+        }}
+        onBack={() => setActiveStage("missions")}
+      />
+    );
+  }
+
+  if (activeStage === "missions") {
+    return (
+      <SolarSystemHome
+        missions={MISSIONS}
+        completedMissions={completedMissions}
+        trainingProgress={trainingProgress}
+        onStartMission={(id) => {
+          handleSelectMission(id);
+          // We need a way to signal that we are "in" a mission view now.
+          // Since the original code rendered Mission1Layout directly when currentMissionId was set,
+          // we need to introduce a new stage or flag.
+          // Actually, the original code had:
+          // if (currentMissionId === "exo1-m1") return <Mission1Layout ... />
+          // This was at the top level return.
+          //
+          // To support the new flow:
+          // 1. "missions" stage = SolarSystemHome
+          // 2. "playing" stage = Mission1Layout (or generic MissionLayout)
+
+          setActiveStage("playing");
+        }}
+        onOpenGarage={goToGarage}
+      />
+    );
+  }
+
+  // Playing Stage (Mission 1 or others)
+  if (activeStage === "playing") {
+    // For now, only Mission 1 has a layout. 
+    // Future: Generic MissionLayout
+    if (currentMissionId === "exo1-m1") {
+      return (
+        <Mission1Layout
+          mission={isChallengeMode && currentMission.challenge ? {
+            ...currentMission,
+            title: currentMission.challenge.title,
+            world: {
+              ...currentMission.world,
+              goal: currentMission.challenge.beacon
+            }
+          } : currentMission}
+          code={code}
+          onCodeChange={handleCodeChange}
+          onRun={handleRun}
+          onReset={handleResetToStarter} // Use handleResetToStarter to handle different starter codes
+          status={status}
+          lastRunSuccess={lastRunSuccess}
+          program={program}
+          runId={runId}
+          commands={commands}
+          onResult={handleResult}
+          onStartDebrief={handleStartDebrief}
+          onOpenGarage={goToGarage}
+          onBack={() => {
+            if (isChallengeMode) {
+              // Exit challenge mode
+              setIsChallengeMode(false);
+              // Restore normal mission code
+              const saved = codeByMission[currentMissionId] ?? currentMission.defaultCode;
+              setCode(saved);
+              setActiveStage("teaching"); // Go back to debrief? Or missions? Debrief seems better flow.
+            } else {
+              setActiveStage("missions");
+            }
+          }}
+          isChallengeMode={isChallengeMode}
+        />
+      );
+    }
+
+    if (currentMissionId === "sensor_stop") {
+      return (
+        <Mission2Layout
+          mission={currentMission}
+          code={code}
+          onCodeChange={handleCodeChange}
+          onRun={handleRun}
+          onReset={handleReset}
+          status={status}
+          lastRunSuccess={lastRunSuccess}
+          program={program}
+          runId={runId}
+          commands={commands}
+          onResult={handleResult}
+          onStartDebrief={handleStartDebrief}
+          onOpenGarage={goToGarage}
+          onBack={() => setActiveStage("missions")}
+        />
+      );
+    }
+
+    // Fallback for other missions (placeholder)
+    return (
+      <div className="min-h-screen bg-slate-900 text-white flex items-center justify-center flex-col gap-4">
+        <h1 className="text-2xl">Mission {currentMission.title}</h1>
+        <p>Coming soon...</p>
+        <button onClick={() => setActiveStage("missions")} className="text-emerald-400 hover:underline">
+          Back to Solar System
+        </button>
       </div>
+    );
+  }
 
-      {/* Progress bar */}
-      <div className="px-6 pt-2 flex items-center gap-3 text-xs text-slate-400">
-        <span>
-          Progress:{" "}
-          <span className="text-emerald-400 font-medium">
-            {completedCount}
-          </span>{" "}
-          / {MISSIONS.length} missions complete
-        </span>
-        <div className="flex-1 h-1.5 rounded-full bg-slate-800 overflow-hidden">
-          <div
-            className="h-full bg-emerald-500 transition-all"
-            style={{ width: `${progressPercent}%` }}
-          />
-        </div>
-      </div>
-
-      <main className="p-6 pt-4 grid grid-cols-2 gap-4 h-[calc(100vh-104px)]">
-        <div className="h-full">
-          <CodeEditor code={code} onChange={handleCodeChange} />
-        </div>
-
-        <div className="h-full flex flex-col border border-slate-800 rounded-lg p-4 bg-slate-950/60">
-          {lastRunSuccess && (
-            <div className="mb-3 rounded-md border border-emerald-500/60 bg-emerald-500/10 px-3 py-2 text-xs flex items-center justify-between">
-              <div>
-                <span className="mr-1">🎉</span>
-                <span className="font-semibold text-emerald-300">
-                  Mission complete!
-                </span>{" "}
-                <span className="text-slate-200">
-                  Nova reached the beacon for {currentMission.shortName}.
-                </span>
-              </div>
-              <button
-                className="ml-3 text-slate-300 hover:text-slate-100"
-                onClick={() => setLastRunSuccess(null)}
-              >
-                ✕
-              </button>
-            </div>
-          )}
-
-          <div className="mb-3">
-            <h2 className="text-lg font-semibold">Mission Briefing</h2>
-            <p className="text-xs text-slate-400 mt-1 whitespace-pre-line">
-              {currentMission.briefing}
-            </p>
-          </div>
-
-          <h2 className="text-lg font-semibold mb-2">Nova Simulator</h2>
-
-          <div className="mb-3">
-            {USE_UAIBOT_VIEW ? (
-              <div className="relative">
-                {/* Main: 3D surface cam */}
-                <UAIbotView
-                  world={currentMission.world}
-                  program={program}
-                  runId={runId}
-                />
-
-                {/* Overlay: 2D orbital map as a minimap */}
-                <div className="absolute bottom-3 left-3 w-2/5 max-w-xs border border-slate-700 rounded-md bg-slate-900/90 shadow-lg shadow-black/60">
-                  <SimulatorView
-                    commands={commands}
-                    program={program}
-                    runId={runId}
-                    world={currentMission.world}
-                    onResult={handleResult}
-                  />
-                </div>
-
-
-                {/* Small legend in the top-right */}
-                <div className="absolute top-2 right-3 text-[0.65rem] text-slate-300 bg-slate-900/80 px-2 py-1 rounded-full border border-slate-700 flex items-center gap-2">
-                  <span className="flex items-center gap-1">
-                    <span className="w-2 h-2 rounded-full bg-emerald-400" />
-                    Surface cam
-                  </span>
-                  <span className="text-slate-500">•</span>
-                  <span className="flex items-center gap-1">
-                    <span className="w-2 h-2 rounded-full bg-sky-400" />
-                    Orbital map
-                  </span>
-                </div>
-              </div>
-            ) : (
-              // Fallback: only 2D view when UAIbot is off
-              <SimulatorView
-                commands={commands}
-                program={program}
-                runId={runId}
-                world={currentMission.world}
-                onResult={handleResult}
-              />
-            )}
-          </div>
-
-
-          <div className="flex gap-2 mb-2">
-            <button
-              className="px-4 py-2 rounded-md bg-emerald-500 hover:bg-emerald-600 text-sm font-medium"
-              onClick={handleRun}
-            >
-              Run Mission
-            </button>
-            <button
-              className="px-4 py-2 rounded-md bg-slate-700 hover:bg-slate-600 text-sm"
-              onClick={handleReset}
-            >
-              Reset
-            </button>
-            <button
-              className="px-4 py-2 rounded-md bg-slate-800 hover:bg-slate-700 text-xs text-slate-200"
-              onClick={handleResetToStarter}
-            >
-              Reset to Starter
-            </button>
-          </div>
-
-          <div className="text-sm text-slate-300 min-h-[1.5rem]">
-            {status && <span>{status}</span>}
-          </div>
-        </div>
-      </main>
-    </div>
-  );
+  return null; // Should not reach here
 }
 
 export default App;

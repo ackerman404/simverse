@@ -30,3 +30,23 @@ We want:
 3. Non-destructive changes:
    - Reuse existing components where possible.
    - Add new React components instead of rewriting the whole app.
+
+
+
+New requirement: Teaching / Lab Debrief stage
+
+After a mission is successfully completed (Mission Complete modal shown), the user should go into a "Teaching stage" (Lab Debrief) for that mission.
+
+For Mission 1 (Movement system), the Teaching stage should:
+
+- Recap what the player did in kid-friendly language.
+- Explain the core concept: Movement = distances + turning.
+- Include one small interactive question (MCQ) to reinforce the idea.
+- Tie this concept to the Rover Blueprint (Movement system online).
+- On completion, mark a "debrief complete" flag for that mission and return to mission select / main view.
+
+This Teaching stage should be implemented in a reusable way:
+- We should be able to define teaching content per mission in `missions.ts`.
+- A generic `TeachingStage` React component should render the teaching UI given a mission's teaching config.
+- `App.tsx` should manage a new piece of state to show/hide the Teaching stage after Mission Complete.
+

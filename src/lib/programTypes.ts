@@ -1,15 +1,21 @@
 // src/lib/programTypes.ts
 
+export interface RobotPose {
+  x: number;
+  y: number;
+  theta: number; // radians
+}
+
 // Low-level primitives that any simulator (Canvas, UAIbot, real rover)
-// can execute.
+// can execute. Now using a differential drive model.
 export type RobotPrimitive =
   | {
-      type: "move";       // drive straight
-      distance: number;   // meters (positive = forward, negative = backward)
-      speed: number;      // m/s
-    }
+    type: "drive";
+    v: number;        // linear velocity (m/s)
+    w: number;        // angular velocity (rad/s)
+    duration: number; // seconds
+  }
   | {
-      type: "turn";          // rotate in place
-      angleDeg: number;      // degrees (+ = left, - = right)
-      angularSpeed: number;  // deg/s (sign will be handled from angle)
-    };
+    type: "set_pose";
+    pose: RobotPose;
+  };
