@@ -10,6 +10,18 @@ import type { RobotCommand } from "../../lib/pythonRunner";
 import { buildTrajectory, type PoseSample } from "../../lib/trajectory";
 import { computeFrontDistance } from "../../sim/sensors";
 
+import { NovaTutorPanel } from "../../teaching/tutor/NovaTutorPanel";
+import { MiniMapReplay } from "../../teaching/MiniMapReplay";
+import type {
+    TutorStage,
+    TutorContext,
+    MissionResult,
+    ParsedCommand,
+    Pose,
+    ParsedCommandName,
+    TutorStepCaption
+} from "../../teaching/tutor/novaTutorTypes";
+
 interface Mission1LayoutProps {
     mission: Mission;
     code: string;
@@ -64,12 +76,86 @@ export function Mission1Layout({
         r: mission.world.goal.r / SCALE
     };
 
+    // --- Tutor State ---
+    const [tutorStage, setTutorStage] = useState<TutorStage>("intro");
+    const [tutorContext, setTutorContext] = useState<TutorContext | null>(null);
+    const [tutorCaptions, setTutorCaptions] = useState<TutorStepCaption[]>([]);
+    const [currentStepIndex, setCurrentStepIndex] = useState<number>(0);
+
     // --- Simulation State ---
     const [trajectory, setTrajectory] = useState<PoseSample[]>([]);
     const [stepIndex, setStepIndex] = useState(0);
     const [isAnimating, setIsAnimating] = useState(false);
     const animationFrameRef = useRef<number | null>(null);
     const hasReportedResultRef = useRef(false);
+
+    // --- Helper: Build Tutor Context ---
+    function buildTutorContextForTrainingRun(params: {
+        code: string;
+        poseHistory: PoseSample[]; // using PoseSample from trajectory
+        startPose: { x: number; y: number; theta: number };
+        beacon: { x: number; y: number };
+        result: MissionResult;
+    }): TutorContext {
+        const runId = String(Date.now());
+
+        // Simple regex parsing for commands
+        const parsedCommands: ParsedCommand[] = [];
+        const lines = params.code.split('\n');
+        let cmdIndex = 0;
+
+        lines.forEach(line => {
+            const trimmed = line.trim();
+            if (trimmed.startsWith('#') || trimmed.length === 0) return;
+
+            let name: ParsedCommandName = "unknown";
+            let arg: number | null = null;
+
+            const match = trimmed.match(/^(move_forward|turn_left|turn_right)\s*\(\s*([\d.]+)\s*\)/);
+            if (match) {
+                const op = match[1];
+                const val = parseFloat(match[2]);
+                if (op === "move_forward") name = "move_forward";
+                else if (op === "turn_left") name = "turn_left";
+                else if (op === "turn_right") name = "turn_right";
+                arg = val;
+            }
+
+            if (name !== "unknown") {
+                parsedCommands.push({
+                    index: cmdIndex++,
+                    name,
+                    arg
+                });
+            }
+        });
+
+        // Convert trajectory to Pose[] (degrees for theta)
+        const poseHistory: Pose[] = params.poseHistory.map(p => ({
+            t: p.t,
+            x: p.x,
+            y: p.y,
+            thetaDeg: (p.theta * 180) / Math.PI
+        }));
+
+        const startPose: Pose = {
+            t: 0,
+            x: params.startPose.x,
+            y: params.startPose.y,
+            thetaDeg: (params.startPose.theta * 180) / Math.PI
+        };
+
+        return {
+            missionId: "mission-1",
+            runId,
+            code: params.code,
+            parsedCommands,
+            poseHistory,
+            startPose,
+            beacon: params.beacon,
+            result: params.result,
+        };
+    }
 
     // --- 1. Build Trajectory on Run ---
     useEffect(() => {
@@ -124,6 +210,23 @@ export function Mission1Layout({
                         // Convert path to {x,y} array
                         const path = trajectory.map(p => ({ x: p.x, y: p.y }));
                         onResult(success, path);
+
+                        // Build Tutor Context (Training Only)
+                        if (!isChallengeMode) {
+                            const result: MissionResult = success ? "success" : "missed_beacon";
+                            // Note: could add timeout/runtime_error logic if we had it
+
+                            const ctx = buildTutorContextForTrainingRun({
+                                code,
+                                poseHistory: trajectory,
+                                startPose: { x: startMeters.x, y: startMeters.y, theta: startTheta },
+                                beacon: { x: goalMeters.x, y: goalMeters.y },
+                                result
+                            });
+
+                            setTutorContext(ctx);
+                            setTutorStage("after_run");
+                        }
                     }
                     return trajectory.length - 1;
                 }
@@ -137,22 +240,9 @@ export function Mission1Layout({
         return () => {
             if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
         };
-    }, [isAnimating, trajectory, onResult, goalMeters]);
+    }, [isAnimating, trajectory, onResult, goalMeters, isChallengeMode, code, startMeters, startTheta]);
 
     // --- 3. GridMapView Props ---
-    // Conversion (Pixels -> Meters)
-    // Mission 1 World is defined in Pixels (Y-down).
-    // GridMapView expects Meters (Y-up).
-    // We need to convert and flip Y.
-    // The user said "The sim core now uses RobotPose...".
-    // In `SimulatorView` fix, I used `SCALE = 80`.
-    // So `mission.world` coordinates are in PIXELS.
-    // `GridMapView` expects generic units.
-    // I should convert everything to METERS for `GridMapView` to be "proper".
-    //
-    // Actually, let's fix the useEffect logic instead of patching here.
-    // See the updated useEffect below.
-
     const bounds: GridBounds = {
         minX: 0,
         maxX: 600 / SCALE, // 7.5m
@@ -183,15 +273,10 @@ export function Mission1Layout({
     }
 
     // Current Pose & Path
-    // trajectory state is now expected to be in World Meters (Y-up).
     const currentPose = trajectory[stepIndex];
     const pathVecs = trajectory.map(p => ({ x: p.x, y: p.y }));
 
     // --- Sensor Simulation for Visualization ---
-    // We want to visualize what the sensor sees from the CURRENT pose.
-    // We need to construct a WorldGeometry in Meters.
-    // We already have 'obstacles' (GridMapView format). We need to map to 'sensors' format.
-
     let sensorRays: { from: { x: number; y: number }; to: { x: number; y: number } }[] | undefined;
 
     if (currentPose) {
@@ -200,12 +285,6 @@ export function Mission1Layout({
         };
 
         const dist = computeFrontDistance(currentPose, sensorWorld);
-
-        // Compute ray endpoint
-        // If dist is maxRange (5.0), we still draw it to show "nothing detected" or "clear"
-        // But maybe we want to clamp it for visualization?
-        // computeFrontDistance returns maxRange if no hit.
-        // Let's draw the full ray.
 
         const rayEnd = {
             x: currentPose.x + dist * Math.cos(currentPose.theta),
@@ -217,6 +296,10 @@ export function Mission1Layout({
             to: rayEnd
         }];
     }
+
+    // Get current caption for step-through
+    const currentCaption =
+        tutorCaptions.find(c => c.commandIndex === currentStepIndex)?.caption ?? "";
 
     return (
         <div className="h-screen overflow-hidden bg-slate-900 text-slate-100 flex flex-col">
@@ -260,56 +343,90 @@ export function Mission1Layout({
             {/* Blueprint Strip */}
             <RoverBlueprintStrip movementOnline={!!lastRunSuccess} />
 
-            {/* Main Content */}
-            <main className="flex-1 min-h-0 overflow-y-auto p-6 grid grid-cols-2 gap-6">
-                {/* Left Panel: Code Editor */}
-                <div className="flex flex-col gap-4 min-h-[500px] h-full">
-                    <div className="flex-1 border border-slate-800 rounded-lg overflow-hidden">
-                        <CodeEditor code={code} onChange={onCodeChange} />
-                    </div>
-
-                    <div className="flex gap-3">
-                        <button
-                            className="flex-1 py-3 rounded-md bg-emerald-600 hover:bg-emerald-500 text-white font-bold shadow-lg shadow-emerald-900/20 transition-all active:scale-[0.98]"
-                            onClick={onRun}
-                        >
-                            ▶ Run Sequence
-                        </button>
-                        <button
-                            className="px-6 py-3 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium transition-all"
-                            onClick={onReset}
-                        >
-                            ↺ Reset
-                        </button>
-                    </div>
-
-                    {status && (
-                        <div className={`p-3 rounded-md text-sm border ${lastRunSuccess
-                            ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-300"
-                            : "bg-slate-800 border-slate-700 text-slate-300"
-                            }`}>
-                            {status}
+            {/* Main Layout: Flex container to hold Content + Tutor Panel */}
+            <div className="flex-1 min-h-0 flex overflow-hidden">
+                {/* Main Content */}
+                <main className="flex-1 min-h-0 overflow-y-auto p-6 grid grid-cols-2 gap-6">
+                    {/* Left Panel: Code Editor */}
+                    <div className="flex flex-col gap-4 min-h-[500px] h-full">
+                        <div className="flex-1 border border-slate-800 rounded-lg overflow-hidden">
+                            <CodeEditor code={code} onChange={onCodeChange} />
                         </div>
-                    )}
-                </div>
 
-                {/* Right Panel: Simulator */}
-                <div className="flex flex-col border border-slate-800 rounded-lg p-1 bg-slate-950 relative overflow-hidden min-h-[500px] h-full">
-                    <div className="relative w-full h-full rounded overflow-hidden">
-                        <GridMapView
-                            bounds={bounds}
-                            path={pathVecs}
-                            beacons={beacons}
-                            obstacles={[]} // Hide obstacles (crater) from visual map as requested
-                            roverPose={currentPose}
-                            sensorRays={sensorRays}
-                            title="Mission 01 · Nova's Map"
-                            className="w-full h-full"
-                            showAxes={true}
+                        <div className="flex gap-3">
+                            <button
+                                className="flex-1 py-3 rounded-md bg-emerald-600 hover:bg-emerald-500 text-white font-bold shadow-lg shadow-emerald-900/20 transition-all active:scale-[0.98]"
+                                onClick={onRun}
+                            >
+                                ▶ Run Sequence
+                            </button>
+                            <button
+                                className="px-6 py-3 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium transition-all"
+                                onClick={onReset}
+                            >
+                                ↺ Reset
+                            </button>
+                        </div>
+
+                        {status && (
+                            <div className={`p-3 rounded-md text-sm border flex justify-between items-center ${lastRunSuccess
+                                ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-300"
+                                : "bg-slate-800 border-slate-700 text-slate-300"
+                                }`}>
+                                <span>{status}</span>
+
+                                {/* Step Through Button (Training Only) */}
+                                {!isChallengeMode && tutorContext && (
+                                    <button
+                                        onClick={() => setTutorStage("step_through")}
+                                        className="ml-2 px-2 py-1 bg-blue-600 hover:bg-blue-500 text-white text-xs rounded"
+                                    >
+                                        Step Through
+                                    </button>
+                                )}
+                            </div>
+                        )}
+                    </div>
+
+                    {/* Right Panel: Simulator or Replay */}
+                    <div className="flex flex-col border border-slate-800 rounded-lg p-1 bg-slate-950 relative overflow-hidden min-h-[500px] h-full">
+                        <div className="relative w-full h-full rounded overflow-hidden flex items-center justify-center">
+                            {tutorStage === "step_through" && !isChallengeMode ? (
+                                <MiniMapReplay
+                                    path={pathVecs}
+                                    goal={{ x: goalMeters.x, y: goalMeters.y }}
+                                    start={{ x: startMeters.x, y: startMeters.y }}
+                                    onStepChange={setCurrentStepIndex}
+                                    stepCaption={currentCaption}
+                                />
+                            ) : (
+                                <GridMapView
+                                    bounds={bounds}
+                                    path={pathVecs}
+                                    beacons={beacons}
+                                    obstacles={[]} // Hide obstacles (crater) from visual map as requested
+                                    roverPose={currentPose}
+                                    sensorRays={sensorRays}
+                                    title="Mission 01 · Nova's Map"
+                                    className="w-full h-full"
+                                    showAxes={true}
+                                />
+                            )}
+                        </div>
+                    </div>
+                </main>
+
+                {/* Tutor Panel (Training Only) */}
+                {!isChallengeMode && (
+                    <div className="w-80 flex-shrink-0 border-l border-slate-800 bg-slate-900 p-4 overflow-y-auto">
+                        <NovaTutorPanel
+                            stage={tutorStage}
+                            context={tutorContext}
+                            onCaptionsChange={setTutorCaptions}
                         />
                     </div>
-                </div>
-            </main>
+                )}
+            </div>
 
             {/* Success Modal Overlay */}
             {lastRunSuccess && (
@@ -325,12 +442,32 @@ export function Mission1Layout({
                                 ? "Prototype R-0 has successfully reached the test pad. Movement systems are now ONLINE."
                                 : "You've successfully guided Nova to the beacon. Proceed to Debrief to analyze the flight path."}
                         </p>
-                        <button
-                            onClick={onStartDebrief}
-                            className="px-6 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-900 font-bold rounded-full transition-colors"
-                        >
-                            Start Debrief
-                        </button>
+                        <div className="flex gap-3 justify-center">
+                            {isChallengeMode ? (
+                                <button
+                                    onClick={onStartDebrief}
+                                    className="px-6 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-900 font-bold rounded-full transition-colors shadow-lg shadow-emerald-500/20"
+                                >
+                                    Collect Reward
+                                </button>
+                            ) : (
+                                <button
+                                    onClick={onStartDebrief}
+                                    className="px-6 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-900 font-bold rounded-full transition-colors"
+                                >
+                                    Start Debrief
+                                </button>
+                            )}
+
+                            {!isChallengeMode && tutorContext && (
+                                <button
+                                    onClick={() => setTutorStage("step_through")}
+                                    className="px-6 py-2 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-full transition-colors"
+                                >
+                                    Step Through
+                                </button>
+                            )}
+                        </div>
                     </div>
                 </div>
             )}
